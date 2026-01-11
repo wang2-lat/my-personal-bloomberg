@@ -1,193 +1,514 @@
 import os
 import datetime
 import requests
+import json
+import re
 import feedparser
 import finnhub
-import re
 from google import genai
 from zoneinfo import ZoneInfo
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1. 配置层 (Secrets 加载)
+# 配置层
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_config():
     cfg = {
-        "tg_token": os.getenv("TELEGRAM_TOKEN"),
-        "chat_id": os.getenv("CHAT_ID"),
+        "lark_id": os.getenv("LARK_APP_ID"),
+        "lark_secret": os.getenv("LARK_APP_SECRET"),
+        "lark_chat_id": os.getenv("LARK_CHAT_ID"),  # 飞书群 chat_id
         "finnhub_key": os.getenv("FINNHUB_KEY"),
         "gemini_key": os.getenv("GEMINI_KEY"),
-        "fred_key": os.getenv("FRED_KEY") 
+        "fred_key": os.getenv("FRED_KEY")
     }
+    missing = [k for k, v in cfg.items() if not v and k != "fred_key"]
+    if missing:
+        raise ValueError(f"缺少环境变量: {missing}")
     return cfg
 
 cfg = get_config()
 fh_client = finnhub.Client(api_key=cfg["finnhub_key"])
 gemini_client = genai.Client(api_key=cfg["gemini_key"])
 
-# 高频 Ticker 映射表
+# 公司名 → Ticker 映射
 COMPANY_TICKER_MAP = {
     "nvidia": "NVDA", "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL",
-    "amazon": "AMZN", "meta": "META", "tesla": "TSLA", "amd": "AMD"
+    "alphabet": "GOOGL", "amazon": "AMZN", "meta": "META", "tesla": "TSLA",
+    "netflix": "NFLX", "amd": "AMD", "intel": "INTC", "broadcom": "AVGO",
+    "salesforce": "CRM", "oracle": "ORCL", "walmart": "WMT", "costco": "COST",
+    "jpmorgan": "JPM", "goldman": "GS", "morgan stanley": "MS",
+    "boeing": "BA", "exxon": "XOM", "chevron": "CVX", "pfizer": "PFE",
+    "disney": "DIS", "uber": "UBER", "airbnb": "ABNB", "openai": "MSFT",
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 2. 数据抓取引擎 (Market & Stock)
+# 飞书 API 层
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def get_market_pulse():
-    """获取大盘指数表格"""
-    indices = [("SPY", "S&P 500"), ("QQQ", "Nasdaq 100"), ("VXX", "VIX Index")]
-    rows = []
+class LarkClient:
+    def __init__(self, app_id, app_secret):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self._token = None
+        self._token_expire = 0
+    
+    def get_token(self):
+        """获取 tenant_access_token，带缓存"""
+        now = datetime.datetime.now().timestamp()
+        if self._token and now < self._token_expire - 60:
+            return self._token
+        
+        url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        try:
+            resp = requests.post(url, json={
+                "app_id": self.app_id,
+                "app_secret": self.app_secret
+            }, timeout=10)
+            data = resp.json()
+            if data.get("code") == 0:
+                self._token = data["tenant_access_token"]
+                self._token_expire = now + data.get("expire", 7200)
+                return self._token
+            else:
+                raise Exception(f"飞书认证失败: {data}")
+        except Exception as e:
+            print(f"获取飞书 Token 失败: {e}")
+            return None
+    
+    def send_card(self, chat_id, card_json):
+        """发送交互式卡片"""
+        token = self.get_token()
+        if not token:
+            print("无法发送卡片：Token 获取失败")
+            return False
+        
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card_json, ensure_ascii=False)
+        }
+        
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=15)
+            result = resp.json()
+            if result.get("code") == 0:
+                return True
+            else:
+                print(f"飞书发送失败: {result}")
+                return False
+        except Exception as e:
+            print(f"飞书请求异常: {e}")
+            return False
+
+lark_client = LarkClient(cfg["lark_id"], cfg["lark_secret"])
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 数据抓取层
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_stock_data(ticker):
+    """获取个股数据"""
+    try:
+        ticker = ticker.upper().strip()
+        if not re.match(r'^[A-Z]{1,5}$', ticker):
+            return None
+        
+        q = fh_client.quote(ticker)
+        if not (q.get('c') and q.get('pc')):
+            return None
+        
+        price = q['c']
+        change = ((price - q['pc']) / q['pc']) * 100
+        
+        # 计算 200 日均线位置
+        ma_200 = calculate_ma_position(ticker, price, 200)
+        
+        # 52 周位置
+        w52 = get_52_week_position(ticker, price)
+        
+        return {
+            "ticker": ticker,
+            "price": price,
+            "change": change,
+            "ma_200": ma_200,
+            "week_52": w52
+        }
+    except:
+        return None
+
+
+def calculate_ma_position(ticker, current_price, days):
+    """计算相对均线位置"""
+    try:
+        end = int(datetime.datetime.now().timestamp())
+        start = end - (days + 30) * 86400
+        candles = fh_client.stock_candles(ticker, 'D', start, end)
+        if candles.get('s') != 'ok' or len(candles.get('c', [])) < days:
+            return None
+        closes = candles['c'][-days:]
+        ma = sum(closes) / len(closes)
+        return round(((current_price - ma) / ma) * 100, 1)
+    except:
+        return None
+
+
+def get_52_week_position(ticker, current_price):
+    """52周位置百分比"""
+    try:
+        end = int(datetime.datetime.now().timestamp())
+        start = end - 365 * 86400
+        candles = fh_client.stock_candles(ticker, 'D', start, end)
+        if candles.get('s') != 'ok':
+            return None
+        high = max(candles.get('h', [current_price]))
+        low = min(candles.get('l', [current_price]))
+        if high == low:
+            return 50
+        return round(((current_price - low) / (high - low)) * 100, 1)
+    except:
+        return None
+
+
+def get_market_indices():
+    """获取大盘指数"""
+    indices = [
+        ("SPY", "S&P500"),
+        ("QQQ", "纳指100"),
+        ("VXX", "VIX恐慌"),
+    ]
+    results = []
     for ticker, name in indices:
         try:
             q = fh_client.quote(ticker)
-            chg = ((q['c'] - q['pc']) / q['pc']) * 100
-            emoji = "🟢" if chg > 0 else "🔴"
-            rows.append(f"| {emoji} {name} | {chg:+.2f}% |")
-        except: continue
-    header = "| 指标 | 涨跌 |\n|:---|:---:|"
-    return header + "\n" + "\n".join(rows)
+            if q.get('c') and q.get('pc'):
+                chg = ((q['c'] - q['pc']) / q['pc']) * 100
+                emoji = "🟢" if chg > 0 else "🔴"
+                results.append(f"{emoji}{name} {chg:+.1f}%")
+        except:
+            continue
+    return " | ".join(results) if results else "数据暂不可用"
 
-def get_stock_data(ticker):
-    """计算个股量化指标 (MA200 & 52周位置)"""
+
+def get_philly_fed():
+    """获取费城联储制造业指数"""
+    if not cfg.get("fred_key"):
+        return "费城联储: 关注制造业PMI"
+    
     try:
-        ticker = ticker.upper().strip()
-        q = fh_client.quote(ticker)
-        current = q['c']
-        # 计算 200 日均线
-        end = int(datetime.datetime.now().timestamp())
-        start = end - 300 * 24 * 60 * 60
-        candles = fh_client.stock_candles(ticker, 'D', start, end)
-        if candles.get('s') == 'ok':
-            closes = candles['c'][-200:]
-            ma200 = sum(closes) / len(closes)
-            pos_ma200 = ((current - ma200) / ma200) * 100
-            
-            high_52 = max(candles['h'][-252:])
-            low_52 = min(candles['l'][-252:])
-            pos_52w = ((current - low_52) / (high_52 - low_52)) * 100
-            
-            return {
-                "ticker": ticker, "price": current, "chg": ((current-q['pc'])/q['pc']*100),
-                "ma200": pos_ma200, "w52": pos_52w
-            }
-    except: return None
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": "GACDFSA066MSFRBPHI",  # 费城联储制造业指数
+            "api_key": cfg["fred_key"],
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 1
+        }
+        resp = requests.get(url, params=params, timeout=5)
+        if resp.ok:
+            obs = resp.json().get("observations", [{}])[0]
+            value = obs.get("value", "N/A")
+            date = obs.get("date", "")
+            return f"费城联储指数: {value} ({date})"
+    except:
+        pass
+    return "费城联储: 数据获取中"
 
-def get_philly_fed_index():
-    """获取费城联储宏观数据"""
-    if cfg["fred_key"]:
+
+def fetch_news():
+    """抓取新闻"""
+    sources = {
+        "WSJ": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+        "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
+    }
+    pool = []
+    for name, url in sources.items():
         try:
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=PHILFEI&api_key={cfg['fred_key']}&file_type=json&limit=1&sort_order=desc"
-            data = requests.get(url).json()
-            val = data['observations'][0]['value']
-            return f"费城联储制造业指数: {val}"
-        except: return "费城联储数据: 暂未更新"
-    return "费城联储数据: 未配置 FRED_KEY"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:3]:
+                pool.append({
+                    "title": entry.get("title", "")[:100],
+                    "summary": entry.get("summary", "")[:300],
+                    "source": name
+                })
+        except:
+            continue
+    return pool[:6]
+
+
+def extract_ticker(text):
+    """从文本识别 Ticker"""
+    text_lower = text.lower()
+    for company, ticker in COMPANY_TICKER_MAP.items():
+        if company in text_lower:
+            return ticker
+    # 正则匹配
+    match = re.search(r'\b([A-Z]{2,4})\b', text)
+    if match:
+        candidate = match.group(1)
+        if candidate not in {'THE', 'AND', 'FOR', 'CEO', 'IPO', 'SEC', 'FDA', 'GDP', 'AI'}:
+            return candidate
+    return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3. AI 分析逻辑 (Prompt 修复版)
+# AI 分析层
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def batch_identify_tickers(news_items):
-    """批量识别 Ticker 以节省 API 额度"""
-    summary_text = "\n".join([f"[{i}] {n['title']}" for i, n in enumerate(news_items)])
-    prompt = f"仅输出股票代码。对以下新闻，识别涉及的美股代码，否则写 NONE。\n{summary_text}\n格式: [序号] TICKER"
-    try:
-        resp = gemini_client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        mapping = {}
-        for line in resp.text.strip().split('\n'):
-            match = re.search(r'\[(\d+)\]\s*([A-Z,\s]+)', line)
-            if match:
-                idx = int(match.group(1))
-                tkrs = [t.strip() for t in match.group(2).split(',') if t.strip() != 'NONE']
-                if tkrs: mapping[idx] = tkrs
-        return mapping
-    except: return {}
-
-def build_v4_prompt(news_items, ticker_map, stock_data, philly_fed_info):
-    """构建带量化数据的深度分析 Prompt"""
-    news_blocks = []
-    for i, news in enumerate(news_items):
-        block = f"【{i+1}】[{news['source']}] {news['title']}\n摘要：{news['summary']}"
-        if i in ticker_map:
-            for t in ticker_map[i]:
-                if t in stock_data:
-                    d = stock_data[t]
-                    block += f"\n📊 数据: {t} ${d['price']:.2f} ({d['chg']:+.2f}%) | MA200位: {d['ma200']:+.1f}% | 52周位: {d['w52']:.0f}%"
-        news_blocks.append(block)
-
-    # 重要：此处使用 {{ }} 转义花括号，防止 Python 报错
-    return f"""
-你是融合了 Wharton 教授与 Citadel PM 思维的首席分析师。
-费城时间：{datetime.datetime.now(ZoneInfo('America/New_York'))}
-
-{chr(10).join(news_blocks)}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【输出格式要求】
-
-## 📰 [{{序号}}] [标题关键词]
-
-**🎯 穿透观点**: 1句话直击本质。
-
-**📊 量化定位**:
-| 指标 | 数值 | 信号 |
-|:---|:---:|:---|
-| 情绪分 | [X]/10 | [利好/利空] |
-| 200日均线位 | [X]% | [趋势判断] |
-
-**⚖️ 三维透视**:
-- *估值逻辑*: 基于实时均线数据分析。
-- *政治风险*: 监管与政策隐患。
-
-**🏛 费城联储视角**: {philly_fed_info} 对该新闻的宏观映射。
+def analyze_news(news, stock_data):
+    """AI 生成极简分析"""
+    stock_context = ""
+    if stock_data:
+        stock_context = f"""
+相关股票数据：
+- 代码: {stock_data['ticker']}
+- 价格: ${stock_data['price']:.2f}
+- 涨跌: {stock_data['change']:+.2f}%
+- MA200位置: {stock_data['ma_200']}%
+- 52周位置: {stock_data['week_52']}%
 """
+    
+    prompt = f"""
+你是 Citadel 首席策略师。用一句话（不超过35字）穿透这条新闻的本质。
+同时给出情绪分（1-10，1=极度利空，10=极度利好）。
+
+新闻标题：{news['title']}
+新闻摘要：{news['summary']}
+{stock_context}
+
+输出格式（严格遵守）：
+分数: [数字]
+观点: [一句话]
+"""
+    
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        text = resp.text.strip()
+        
+        # 解析
+        score = 5
+        analysis = "暂无分析"
+        
+        score_match = re.search(r'分数:\s*(\d+)', text)
+        if score_match:
+            score = int(score_match.group(1))
+            score = max(1, min(10, score))
+        
+        view_match = re.search(r'观点:\s*(.+)', text)
+        if view_match:
+            analysis = view_match.group(1).strip()[:40]
+        
+        return score, analysis
+    except Exception as e:
+        print(f"AI 分析失败: {e}")
+        return 5, "分析暂不可用"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4. 主程序执行
+# 飞书卡片构建
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def run_v4_terminal():
-    print("🚀 Bloomberg V4.0 Alpha 启动中...")
-    start_time = datetime.datetime.now()
+def build_header_card(market_data, philly_fed):
+    """构建市场概览卡片"""
     philly_time = datetime.datetime.now(ZoneInfo("America/New_York"))
     
-    # 抓取新闻 (WSJ & NYT)
-    feeds = ["https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"]
-    news = []
-    for url in feeds:
-        f = feedparser.parse(url)
-        for e in f.entries[:3]:
-            news.append({"title": e.title, "summary": e.get('summary', '')[:300], "source": "WSJ/NYT"})
-    
-    # 获取宏观与量化数据
-    fed_info = get_philly_fed_index()
-    ticker_map = batch_identify_tickers(news)
-    
-    unique_tickers = set()
-    for tlist in ticker_map.values(): unique_tickers.update(tlist)
-    
-    stock_stats = {}
-    for t in list(unique_tickers)[:5]: # 限制 5 只以防限流
-        data = get_stock_data(t)
-        if data: stock_stats[t] = data
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "🏛 王同学的决策终端 V5.0"},
+            "template": "blue"
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"📅 **{philly_time.strftime('%Y-%m-%d %H:%M')}** | Philadelphia"
+                }
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"📈 **市场脉搏**: {market_data}"
+                }
+            },
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"🏭 **{philly_fed}**"
+                }
+            }
+        ]
+    }
 
-    # AI 分析
-    prompt = build_v4_prompt(news, ticker_map, stock_stats, fed_info)
-    response = gemini_client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+
+def build_news_card(title, source, score, analysis, stock_data):
+    """构建单条新闻卡片"""
+    # 颜色主题
+    if score >= 7:
+        theme = "green"
+        emoji = "🟢"
+    elif score <= 4:
+        theme = "red"
+        emoji = "🔴"
+    else:
+        theme = "grey"
+        emoji = "⚪"
     
-    # 最终报告组装
-    header = f"🏛 *王同学的全球决策终端 V4.0*\n📅 {philly_time.strftime('%Y-%m-%d %H:%M')}\n"
-    header += f"📈 *市场脉搏*\n{get_market_pulse()}\n\n"
-    header += f"🏭 {fed_info}\n━━━━━━━━━━━━━━\n\n"
+    # 标题截断
+    short_title = title[:25] + "..." if len(title) > 25 else title
     
-    full_report = header + response.text
+    elements = []
     
-    # 发送
-    requests.post(f"https://api.telegram.org/bot{cfg['tg_token']}/sendMessage", 
-                  data={"chat_id": cfg['chat_id'], "text": full_report[:4000], "parse_mode": "Markdown"})
-    print(f"✅ 报告已发送 (耗时 {(datetime.datetime.now() - start_time).seconds}s)")
+    # 如果有股票数据，显示分栏
+    if stock_data:
+        ma_str = f"{stock_data['ma_200']:+.1f}%" if stock_data['ma_200'] else "N/A"
+        w52_str = f"{stock_data['week_52']:.0f}%" if stock_data['week_52'] else "N/A"
+        
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "bisect",
+            "background_style": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**{stock_data['ticker']}** ${stock_data['price']:.2f}\n涨跌 {stock_data['change']:+.2f}%"
+                        }
+                    }]
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [{
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"MA200: {ma_str}\n52周: {w52_str}"
+                        }
+                    }]
+                }
+            ]
+        })
+        elements.append({"tag": "hr"})
+    
+    # 分析观点
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"**🎯 穿透观点**: {analysis}"
+        }
+    })
+    
+    # 底部标注
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": f"{emoji} 情绪分 {score}/10 | 来源: {source}"
+        }]
+    })
+    
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": short_title},
+            "template": theme
+        },
+        "elements": elements
+    }
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 主程序
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_v5():
+    print("🚀 Bloomberg V5.0 飞书版启动...")
+    
+    # 1. 获取市场数据
+    print("📈 抓取市场指数...")
+    market_data = get_market_indices()
+    philly_fed = get_philly_fed()
+    
+    # 2. 发送头部卡片
+    header_card = build_header_card(market_data, philly_fed)
+    lark_client.send_card(cfg["lark_chat_id"], header_card)
+    
+    # 3. 抓取新闻
+    print("📰 抓取新闻...")
+    news_list = fetch_news()
+    if not news_list:
+        print("⚠️ 无新闻")
+        return
+    
+    # 4. 逐条处理
+    for i, news in enumerate(news_list):
+        print(f"   处理 [{i+1}/{len(news_list)}]: {news['title'][:30]}...")
+        
+        # 识别 Ticker
+        ticker = extract_ticker(news['title'] + " " + news['summary'])
+        
+        # 获取股票数据
+        stock_data = None
+        if ticker:
+            stock_data = get_stock_data(ticker)
+        
+        # AI 分析
+        score, analysis = analyze_news(news, stock_data)
+        
+        # 构建并发送卡片
+        card = build_news_card(
+            title=news['title'],
+            source=news['source'],
+            score=score,
+            analysis=analysis,
+            stock_data=stock_data
+        )
+        lark_client.send_card(cfg["lark_chat_id"], card)
+    
+    print("✅ V5.0 报告已发送至飞书")
+
 
 if __name__ == "__main__":
-    run_v4_terminal()
+    run_v5()
+```
+
+---
+
+## 📋 V5.0 对比 Gemini 原版
+
+| 问题 | Gemini 原版 | 修复版 |
+|:-----|:-----------|:-------|
+| 数据源 | Mock 假数据 | 完整接入 RSS + Finnhub |
+| Token 管理 | 无缓存，每次重新获取 | 带过期缓存 |
+| 错误处理 | 几乎没有 | 全链路 try-except |
+| 费城联储 | 只写了字符串 | 真实调用 FRED API |
+| 分栏排版 | 用 fields | 用 column_set（更稳定） |
+| AI 分析 | 没有 | 完整 Gemini 调用 + 解析 |
+| 批量发送 | 没设计 | 头部卡片 + 逐条新闻卡片 |
+
+---
+
+## 🔧 部署 Checklist
+
+### 新增 GitHub Secrets:
+```
+LARK_APP_ID=cli_xxxxx
+LARK_APP_SECRET=xxxxx
+LARK_CHAT_ID=oc_xxxxx   # 飞书群的 chat_id
+FRED_KEY=xxxxx          # 可选
