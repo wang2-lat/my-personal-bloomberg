@@ -1,4 +1,4 @@
-name: Bloomberg_V5_Production
+name: Bloomberg_V7_Pro
 
 on:
   push:
@@ -10,20 +10,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-
+      
       - name: Install dependencies
-        run: pip install finnhub-python google-genai requests feedparser
-
-      - name: Run V5.0 Terminal
+        run: pip install yfinance finnhub-python google-genai requests feedparser
+      
+      - name: Run Bloomberg V7
         env:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
@@ -31,4 +28,5 @@ jobs:
           FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           FRED_KEY: ${{ secrets.FRED_KEY }}
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
         run: python push_telegram.py
