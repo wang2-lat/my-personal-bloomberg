@@ -3,12 +3,15 @@ name: Bloomberg_V5_Production
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:  # 允许你手动点击按钮运行
+  schedule:
+    # 美东时间周一至周五早上 8:00 (UTC 13:00)
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -19,11 +22,9 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: |
-          pip install finnhub-python google-genai requests feedparser
+        run: pip install finnhub-python google-genai requests feedparser
 
-      - name: Run AI Report
-        # 🟢 关键：在这里把 GitHub 网页里的 Secrets 真正“通电”给 Python 代码
+      - name: Run V5.0 Terminal
         env:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
@@ -32,3 +33,16 @@ jobs:
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           FRED_KEY: ${{ secrets.FRED_KEY }}
         run: python push_telegram.py
+```
+
+---
+
+## 📁 文件位置
+
+确保放在这个路径：
+```
+你的仓库/
+├── .github/
+│   └── workflows/
+│       └── main.yml    ← 放这里
+└── push_telegram.py
