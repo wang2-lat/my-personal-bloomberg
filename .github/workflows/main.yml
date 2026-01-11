@@ -2,18 +2,19 @@ name: Morning Financial Intelligence
 
 on:
   schedule:
-    - cron: '0 13 * * *' # 费城时间早上 8:00
+    - cron: '15 13 * * 1-5' # 费城时间 8:15 AM (冬令时)，避开整点延迟
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # 将 GitHub Secrets 映射给 Python 环境
+      # 将你存好的 Secrets 映射给 Python 环境
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       CHAT_ID: ${{ secrets.CHAT_ID }}
       FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
       GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+      FRED_KEY: ${{ secrets.FRED_KEY }}
     steps:
       - uses: actions/checkout@v3
       - name: Set up Python
@@ -21,6 +22,7 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install dependencies
-        run: pip install finnhub-python google-generativeai requests feedparser
+        # 升级为最新的 google-genai 官方库
+        run: pip install finnhub-python google-genai requests feedparser
       - name: Run AI Report
         run: python push_telegram.py
