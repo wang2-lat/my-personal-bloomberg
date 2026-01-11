@@ -1,81 +1,66 @@
-import finnhub
-import google.generativeai as genai
-import requests
-import datetime
-import feedparser
-import os
+import finnhub, google.generativeai as genai, requests, datetime, feedparser, os
 
-# --- 1. 配置 (从 GitHub Secrets 自动读取) ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-FINNHUB_KEY = os.getenv("FINNHUB_KEY")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
+# --- 1. 变量检查 ---
+def check_secrets():
+    keys = ["TELEGRAM_TOKEN", "CHAT_ID", "FINNHUB_KEY", "GEMINI_KEY"]
+    for k in keys:
+        val = os.getenv(k)
+        if not val:
+            print(f"❌ 错误：机密变量 {k} 为空！请检查 GitHub Secrets 设置。")
+        else:
+            print(f"✅ 已识别：{k} (长度: {len(val)})")
 
-# --- 2. 初始化客户端 ---
-finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash') # 2026年推荐使用的快速模型
-
-# --- 3. 情报源配置 (借用 finance-news-mcp 核心精华) ---
-RSS_SOURCES = {
-    "WSJ_商业": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
-    "WSJ_市场": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "NYT_技术": "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
-    "NYT_政治": "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"
-}
-
-def get_comprehensive_news():
+# --- 2. 抓取逻辑 ---
+def get_debug_news():
     news_pool = []
-    # 抓取 Finnhub 快讯
+    # 尝试抓取 Finnhub
     try:
-        fh_news = finnhub_client.general_news('general', min_id=0)[:8]
+        fh_news = finnhub.Client(api_key=os.getenv("FINNHUB_KEY")).general_news('general', min_id=0)[:5]
+        print(f"📡 Finnhub 抓取到 {len(fh_news)} 条原始新闻")
         for n in fh_news:
             news_pool.append({"title": n['headline'], "summary": n['summary'], "source": "Finnhub"})
-    except: print("Finnhub 获取失败")
+    except Exception as e:
+        print(f"❌ Finnhub 抓取失败: {e}")
+
+    # 尝试抓取 RSS
+    rss_url = "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml"
+    try:
+        feed = feedparser.parse(rss_url)
+        print(f"📡 WSJ RSS 抓取到 {len(feed.entries)} 条原始新闻")
+        for entry in feed.entries[:3]:
+            news_pool.append({"title": entry.title, "summary": getattr(entry, 'summary', ''), "source": "WSJ"})
+    except Exception as e:
+        print(f"❌ RSS 抓取失败: {e}")
     
-    # 抓取 RSS 顶级深度报道
-    for name, url in RSS_SOURCES.items():
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:3]: # 每个源取前 3 条
-                news_pool.append({
-                    "title": entry.title, 
-                    "summary": getattr(entry, 'summary', '查看原文获取详情'), 
-                    "source": name
-                })
-        except: print(f"{name} 获取失败")
     return news_pool
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
-
-def run_ai_terminal():
-    print("🚀 正在收集全球多维情报...")
-    raw_news = get_comprehensive_news()
+# --- 3. 主程序 ---
+def run_debug_terminal():
+    print("🚀 --- 开始深度调试任务 ---")
+    check_secrets()
     
-    header = f"🏛 *王同学的全球情报终端 (Bloomberg 2.0)*\n"
-    header += f"📅 {datetime.date.today()} | 城市: Philadelphia\n"
-    header += "==============================\n\n"
-    
-    send_telegram(header) # 先发报头
+    raw_news = get_debug_news()
+    print(f"📊 待处理新闻总计: {len(raw_news)} 条")
 
-    for item in raw_news[:12]: # 选取最精华的 12 条进行 AI 深度解析
-        prompt = f"""
-        你是一名身处费城的资深量化与政治分析师。
-        请对以下来自顶级媒体（{item['source']}）的新闻进行【彭博终端级】深度解读：
-        
-        1. 【核心翻译】简明扼要的中文总结。
-        2. 【深度洞察】结合 AI 浪潮（如 Nvidia）、地缘政治或历史背景分析本质。
-        3. 【情绪评分】利好/利空程度 (-10 到 +10)。
-        
-        新闻标题：{item['title']}
-        新闻内容：{item['summary']}
-        """
+    if len(raw_news) == 0:
+        print("📭 警告：没有任何新闻源返回数据，调试结束。")
+        return
+
+    # 初始化 AI
+    genai.configure(api_key=os.getenv("GEMINI_KEY"))
+    model = genai.GenerativeModel('gemini-2.0-flash')
+
+    for i, item in enumerate(raw_news):
+        print(f"🤖 正在处理第 {i+1} 条 AI 分析...")
+        prompt = f"请简短总结这则新闻：{item['title']}"
         try:
             analysis = model.generate_content(prompt).text.strip()
-            send_telegram(analysis) # 逐条发送，防止消息过长被屏蔽
-        except: continue
+            # 强制发送，观察返回
+            url = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_TOKEN')}/sendMessage"
+            res = requests.post(url, data={"chat_id": os.getenv("CHAT_ID"), "text": f"测试 {i+1}:\n{analysis}"})
+            print(f"📤 Telegram 返回状态: {res.status_code}")
+        except Exception as e:
+            print(f"❌ 分析或发送失败: {e}")
 
 if __name__ == "__main__":
-    run_ai_terminal()
+    run_debug_terminal()
