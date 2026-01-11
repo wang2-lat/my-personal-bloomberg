@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main ]
   schedule:
-    # 美东时间周一至周五早上 8:00 (UTC 13:00)
     - cron: '0 13 * * 1-5'
   workflow_dispatch:
 
@@ -33,16 +32,3 @@ jobs:
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           FRED_KEY: ${{ secrets.FRED_KEY }}
         run: python push_telegram.py
-```
-
----
-
-## 📁 文件位置
-
-确保放在这个路径：
-```
-你的仓库/
-├── .github/
-│   └── workflows/
-│       └── main.yml    ← 放这里
-└── push_telegram.py
