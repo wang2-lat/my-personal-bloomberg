@@ -2,59 +2,80 @@ import finnhub
 import google.generativeai as genai
 import requests
 import datetime
+import feedparser
+import os
 
-# --- 1. 配置信息 ---
-TELEGRAM_TOKEN = "7762507386:AAG_FsGY2ur7yB6CID-9zKk3BaniBnHUmGI"
-CHAT_ID = "8048594162"  # 填入第一步拿到的数字
-FINNHUB_KEY = "d5hf2tpr01qqequ238dgd5hf2tpr01qqequ238e0"
-GEMINI_KEY = "AIzaSyDOOazqDeyv8XBbaG5F5zKIiEpDroqHdpA"
+# --- 1. 配置 (从 GitHub Secrets 自动读取) ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+FINNHUB_KEY = os.getenv("FINNHUB_KEY")
+GEMINI_KEY = os.getenv("GEMINI_KEY")
 
-# --- 2. 初始化 ---
+# --- 2. 初始化客户端 ---
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash') # 使用最快模型
+model = genai.GenerativeModel('gemini-2.0-flash') # 2026年推荐使用的快速模型
 
-def send_telegram_msg(text):
+# --- 3. 情报源配置 (借用 finance-news-mcp 核心精华) ---
+RSS_SOURCES = {
+    "WSJ_商业": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+    "WSJ_市场": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "NYT_技术": "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
+    "NYT_政治": "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"
+}
+
+def get_comprehensive_news():
+    news_pool = []
+    # 抓取 Finnhub 快讯
+    try:
+        fh_news = finnhub_client.general_news('general', min_id=0)[:8]
+        for n in fh_news:
+            news_pool.append({"title": n['headline'], "summary": n['summary'], "source": "Finnhub"})
+    except: print("Finnhub 获取失败")
+    
+    # 抓取 RSS 顶级深度报道
+    for name, url in RSS_SOURCES.items():
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:3]: # 每个源取前 3 条
+                news_pool.append({
+                    "title": entry.title, 
+                    "summary": getattr(entry, 'summary', '查看原文获取详情'), 
+                    "source": name
+                })
+        except: print(f"{name} 获取失败")
+    return news_pool
+
+def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    requests.post(url, data=payload)
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
-def run_ai_morning_report():
-    print("🚀 正在抓取并分析新闻...")
-    news = finnhub_client.general_news('general', min_id=0)
+def run_ai_terminal():
+    print("🚀 正在收集全球多维情报...")
+    raw_news = get_comprehensive_news()
     
-    # 结合你的兴趣：AI、Nvidia、费城、沃顿研究
-    interests = ["AI", "Nvidia", "Software", "Wharton", "Philadelphia", "Fed"]
+    header = f"🏛 *王同学的全球情报终端 (Bloomberg 2.0)*\n"
+    header += f"📅 {datetime.date.today()} | 城市: Philadelphia\n"
+    header += "==============================\n\n"
     
-    report = f"🤖 *个人金融情报终端* \n"
-    report += f"📅 {datetime.date.today()} | 城市: Philadelphia\n"
-    report += "----------------------------\n"
-    
-    count = 0
-    for item in news:
-        # 只处理你关心的关键词
-        if any(word.lower() in item['headline'].lower() for word in interests):
-            # 调用 AI 进行中文深度摘要
-            prompt = f"""
-            你是一个资深分析师。请用中文总结这则新闻对市场或相关公司的影响（20字以内）。
-            新闻标题：{item['headline']}
-            摘要：{item['summary']}
-            """
-            try:
-                ai_summary = model.generate_content(prompt).text.strip()
-                report += f"🔥 *{ai_summary}*\n"
-                report += f"🔗 [阅读原文]({item['url']})\n\n"
-                count += 1
-            except:
-                continue
+    send_telegram(header) # 先发报头
+
+    for item in raw_news[:12]: # 选取最精华的 12 条进行 AI 深度解析
+        prompt = f"""
+        你是一名身处费城的资深量化与政治分析师。
+        请对以下来自顶级媒体（{item['source']}）的新闻进行【彭博终端级】深度解读：
         
-        if count >= 5: break # 每天早上只看最精华的 5 条
-
-    if count > 0:
-        send_telegram_msg(report)
-        print("✅ 成功！请查看你的 Telegram。")
-    else:
-        print("📭 当前无匹配新闻。")
+        1. 【核心翻译】简明扼要的中文总结。
+        2. 【深度洞察】结合 AI 浪潮（如 Nvidia）、地缘政治或历史背景分析本质。
+        3. 【情绪评分】利好/利空程度 (-10 到 +10)。
+        
+        新闻标题：{item['title']}
+        新闻内容：{item['summary']}
+        """
+        try:
+            analysis = model.generate_content(prompt).text.strip()
+            send_telegram(analysis) # 逐条发送，防止消息过长被屏蔽
+        except: continue
 
 if __name__ == "__main__":
-    run_ai_morning_report()
+    run_ai_terminal()
