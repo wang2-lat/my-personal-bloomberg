@@ -1,0 +1,19 @@
+{
+  "builds": [
+    {
+      "src": "api_template.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api_template.py"
+    }
+  ],
+  "env": {
+    "FINNHUB_KEY": "@finnhub_key",
+    "GEMINI_KEY": "@gemini_key",
+    "FRED_KEY": "@fred_key"
+  }
+}
